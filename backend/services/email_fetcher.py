@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any
 import traceback
-from email.utils import parsedate_to_datetime  # <-- added for proper date parsing
+from email.utils import parsedate_to_datetime
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 FETCH_INTERVAL = 300
 
 def refresh_gmail_token(account_record: Dict[str, Any]) -> Credentials:
-    """Refresh Gmail access token if expired."""
     creds = Credentials(
         token=account_record['access_token'],
         refresh_token=account_record['refresh_token'],
@@ -30,7 +29,6 @@ def refresh_gmail_token(account_record: Dict[str, Any]) -> Credentials:
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(GoogleRequest())
-        # Update tokens in database
         supabase.table("email_accounts").update({
             "access_token": creds.token,
             "token_expires_at": creds.expiry.isoformat()
@@ -38,11 +36,9 @@ def refresh_gmail_token(account_record: Dict[str, Any]) -> Credentials:
     return creds
 
 def fetch_new_emails(account_record: Dict[str, Any]):
-    """Fetch new emails from Gmail (inbox and spam) since last fetch."""
     creds = refresh_gmail_token(account_record)
     service = build("gmail", "v1", credentials=creds)
 
-    # Determine last fetch time
     last_fetch = account_record.get('last_fetch_at')
     if last_fetch:
         if isinstance(last_fetch, str):
@@ -54,22 +50,17 @@ def fetch_new_emails(account_record: Dict[str, Any]):
     print(f"Query: {query}")
 
     results = []
-
-    # Fetch from Inbox and Spam
     inbox_results = list_emails(service, 'INBOX', query)
     print(f"Found {len(inbox_results)} emails in INBOX")
     results.extend(inbox_results)
-
     spam_results = list_emails(service, 'SPAM', query)
     print(f"Found {len(spam_results)} emails in SPAM")
     results.extend(spam_results)
 
-    # Store emails in database
     for msg in results:
         print(f"Storing email: {msg['id']}")
         store_email(account_record['user_id'], account_record['id'], msg)
 
-    # Update last_fetch_at
     supabase.table("email_accounts").update({
         "last_fetch_at": datetime.now().isoformat()
     }).eq("id", account_record['id']).execute()
@@ -87,17 +78,18 @@ def list_emails(service, folder: str, query: str):
         print(f"List {folder} returned {len(messages)} messages")
         results = []
         for msg in messages:
+            # Fetch full message to get attachments
             full_msg = service.users().messages().get(
                 userId='me',
                 id=msg['id'],
-                format='metadata',
-                metadataHeaders=['From', 'Subject', 'Date']
+                format='full'   # ← changed from 'metadata'
             ).execute()
             results.append(full_msg)
         return results
     except HttpError as e:
         logger.error(f"Error fetching emails from {folder}: {e}")
         return []
+
 
 def store_email(user_id, account_id, msg):
     """Store email metadata in Supabase."""
@@ -107,7 +99,7 @@ def store_email(user_id, account_id, msg):
     date_str = headers.get('Date', '')
     snippet = msg.get('snippet', '')
 
-    # Parse date string to ISO 8601 format for PostgreSQL
+    # Parse date
     try:
         if date_str:
             parsed_date = parsedate_to_datetime(date_str)
@@ -118,16 +110,27 @@ def store_email(user_id, account_id, msg):
         logger.warning(f"Could not parse date '{date_str}': {e}")
         received_at = datetime.now().isoformat()
 
-    has_attachments = False
-    attachment_info = []
+    # Recursively find attachments
+    def extract_attachments(part, attachment_list):
+        if part.get('filename'):
+            attachment_list.append({
+                'filename': part['filename'],
+                'mimeType': part.get('mimeType'),
+                'attachmentId': part.get('body', {}).get('attachmentId')
+            })
+        if 'parts' in part:
+            for subpart in part['parts']:
+                extract_attachments(subpart, attachment_list)
+
+    attachment_list = []
     if 'parts' in msg['payload']:
         for part in msg['payload']['parts']:
-            if part.get('filename'):
-                has_attachments = True
-                attachment_info.append({
-                    'filename': part['filename'],
-                    'mimeType': part['mimeType']
-                })
+            extract_attachments(part, attachment_list)
+    else:
+        extract_attachments(msg['payload'], attachment_list)
+
+    print(f"📎 Attachments found: {attachment_list}")   # debug
+    has_attachments = len(attachment_list) > 0
 
     data = {
         'user_id': user_id,
@@ -138,8 +141,8 @@ def store_email(user_id, account_id, msg):
         'received_at': received_at,
         'snippet': snippet,
         'has_attachments': has_attachments,
-        'attachment_info': attachment_info,
-        'folder': 'inbox',  # we'll refine later
+        'attachment_info': attachment_list,
+        'folder': 'inbox',  # refine later
         'processed': False
     }
     try:
@@ -148,8 +151,11 @@ def store_email(user_id, account_id, msg):
     except Exception as e:
         logger.error(f"Failed to store email {msg['id']}: {e}")
 
+
+
+
+
 def run_fetcher():
-    """Main loop: fetch emails for all active accounts."""
     logger.info("Starting email fetcher service...")
     while True:
         try:

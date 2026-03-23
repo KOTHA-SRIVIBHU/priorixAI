@@ -8,12 +8,11 @@ from utils.supabase_client import supabase
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-USE_ML = True               # Set False to fallback to rule-based
+USE_ML = False               # Set True only if you have a working ML model
 IMPORTANCE_THRESHOLD = 0.6
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Rule-based categories
+# Rule-based categories (same as before)
 RULES = {
     "interview": {
         "keywords": ["interview", "invitation", "schedule", "meeting"],
@@ -48,7 +47,6 @@ RULES = {
 }
 
 def rule_classify(email_record: Dict[str, Any]) -> Dict[str, Any]:
-    """Classify email based on rule-based keywords."""
     subject = email_record['subject'].lower()
     sender = email_record['sender'].lower()
     snippet = email_record['snippet'].lower()
@@ -74,30 +72,16 @@ def rule_classify(email_record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def ml_classify(email_record: Dict[str, Any]) -> Dict[str, Any]:
-    """Use ML (Hugging Face) for classification and summarization."""
-    try:
-        from services.ml_classifier import classify_with_ml, summarize_with_ml
-        classification = classify_with_ml(email_record)
-        if classification:
-            summary = summarize_with_ml(email_record)
-            classification['summary'] = summary
-            return classification
-        else:
-            logger.warning("ML classification returned None, falling back to rule.")
-            return rule_classify(email_record)
-    except Exception as e:
-        logger.error(f"Error in ML classification: {e}, falling back to rule.")
-        return rule_classify(email_record)
+    # Optional ML implementation; currently disabled
+    return rule_classify(email_record)
 
 def classify_email(email_record: Dict[str, Any]) -> Dict[str, Any]:
-    """Main classification function, switches between ML and rule."""
     if USE_ML:
         return ml_classify(email_record)
     else:
         return rule_classify(email_record)
 
 def send_telegram_alert(chat_id: str, email_record: Dict[str, Any], classification: Dict[str, Any]):
-    """Send notification via Telegram bot."""
     emoji_map = {
         "interview": "📅",
         "deadline": "⏰",
@@ -136,13 +120,10 @@ def send_telegram_alert(chat_id: str, email_record: Dict[str, Any], classificati
         logger.error(f"Failed to send Telegram alert: {e}")
 
 def process_unclassified_emails():
-    """Find unprocessed emails, classify, send alerts, and trigger attachment analysis."""
     emails = supabase.table("emails").select("*").eq("processed", False).execute()
     for email in emails.data:
-        # Classify email
         classification = classify_email(email)
         
-        # Store classification
         supabase.table("classifications").insert({
             "email_id": email["id"],
             "category": classification["category"],
@@ -152,17 +133,16 @@ def process_unclassified_emails():
             "method": classification["method"]
         }).execute()
         
-        # Mark email as processed
         supabase.table("emails").update({"processed": True}).eq("id", email["id"]).execute()
         
-        # If important, send Telegram alert
         if classification["importance_score"] >= IMPORTANCE_THRESHOLD:
             user = supabase.table("profiles").select("telegram_chat_id").eq("id", email["user_id"]).execute()
             if user.data and user.data[0]["telegram_chat_id"]:
                 send_telegram_alert(user.data[0]["telegram_chat_id"], email, classification)
         
-        # Process attachments (if any) – this may update classification or send additional alert
+        # Process attachments
         if email.get("has_attachments"):
+            print(f"🔍 Processing attachments for email {email['id']} ({email['subject'][:30]})")
             try:
                 from services.attachment_analyzer import process_attachments
                 process_attachments(email)
